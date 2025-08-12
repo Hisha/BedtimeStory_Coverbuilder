@@ -2,35 +2,36 @@
 """
 build_cover.py
 
-One-shot cover builder:
-- Locates drop-in artwork under /mnt/ai_data/BedtimeStories
-- Ensures 3000x3000 via high-quality resize + gentle unsharp
-- Renders SVG template with Title/Subtitle/Badge/Palette
-- Outputs {BASE}/{safeTheme}/{safeTheme}_cover.jpg
+One-shot cover builder + optional MP3 cover embedding.
+
+- Finds your art in the base folder (default /mnt/ai_data/BedtimeStories)
+- Resizes art to 3000x3000 (CPU-friendly, Pillow)
+- Renders an SVG cover (gradient + art + title/subtitle/badge) and exports JPG
+- Optionally embeds that cover.jpg into each MP3 in the story folder via ffmpeg
 
 Usage:
-  ./build_cover.py <safeTheme> --title "Friendly Dinosaurs" \
-      [--subtitle "Age 3–7 • Sharing"] [--badge "3 Narrator Voices"] \
-      [--palette warm|cool|forest|/path/palette.json] \
-      [--art friendly_dinosaurs_art.png] \
-      [--base /mnt/ai_data/BedtimeStories] \
+  ./build_cover.py <safeTheme>
+      [--title "Friendly Dinosaurs"]      # optional; auto-derived from safeTheme if omitted
+      [--subtitle "Age 3–7 • Sharing makes everyone feel safe and happy"]
+      [--badge "Includes 3 narrator voices"]
+      [--palette warm|cool|forest|/path/palette.json]
+      [--art friendly_dinosaurs_art.png]  # optional explicit file in base or absolute path
+      [--base /mnt/ai_data/BedtimeStories]
       [--out-name friendly_dinosaurs_cover.jpg]
-
-Env:
-  STORY_BASE overrides --base if set.
+      [--no-embed]                        # skip embedding cover into MP3s
 
 Deps:
+  sudo apt-get install imagemagick ffmpeg  (ffmpeg only needed for embedding)
   pip install jinja2 pillow
-  Optional (for faster SVG→PNG): pip install cairosvg
-  Or have Inkscape CLI installed: sudo apt-get install inkscape
+  (optional: pip install cairosvg or sudo apt-get install inkscape)
 """
-import argparse, os, sys, json, tempfile, shutil, io
+import argparse, os, sys, json, tempfile, shutil, subprocess, textwrap
 from pathlib import Path
-from typing import Optional
+from typing import Optional, List
 from jinja2 import Template
 from PIL import Image, ImageFilter
 
-# ------------------ Config ------------------
+# ---------- Defaults ----------
 DEFAULT_BASE = os.environ.get("STORY_BASE", "/mnt/ai_data/BedtimeStories")
 PALETTES = {
     "warm":   {"BG1":"#1d2540","BG2":"#0c1326","TITLE_COLOR":"#F5F1E8","SUBTITLE_COLOR":"#E7DFCF","BADGE_BG":"#2A3358","BADGE_COLOR":"#F5F1E8"},
@@ -46,9 +47,8 @@ SVG_TEMPLATE = """\
       <stop offset="100%" stop-color="{{ BG2 }}"/>
     </linearGradient>
     <style>
-      /* Use system sans; swap for a bundled TTF if desired */
-      .title   { font: 140px sans-serif; fill: {{ TITLE_COLOR }}; font-weight: 700; }
-      .subtitle{ font: 80px  sans-serif; fill: {{ SUBTITLE_COLOR }}; opacity: 0.92; }
+      .title   { font: {{ TITLE_SIZE }}px sans-serif; fill: {{ TITLE_COLOR }}; font-weight: 700; }
+      .subtitle{ font: {{ SUB_SIZE }}px  sans-serif; fill: {{ SUBTITLE_COLOR }}; opacity: 0.92; }
       .badge   { font: 64px  sans-serif; fill: {{ BADGE_COLOR }}; font-weight: 700; }
     </style>
   </defs>
@@ -62,10 +62,21 @@ SVG_TEMPLATE = """\
   {% endif %}
 
   <!-- Text block -->
-  <g transform="translate(150, 2150)">
-    <text class="title">{{ TITLE }}</text>
-    {% if SUBTITLE %}
-      <text class="subtitle" y="140">{{ SUBTITLE }}</text>
+  <g transform="translate(150, {{ TEXT_BASE_Y }})">
+    {% if TITLE_LINES %}
+    <text class="title">
+      {% for i, line in enumerate(TITLE_LINES) -%}
+        <tspan x="0" dy="{{ 0 if i == 0 else TITLE_LINE_DY }}">{{ line }}</tspan>
+      {%- endfor %}
+    </text>
+    {% endif %}
+
+    {% if SUBTITLE_LINES %}
+      <text class="subtitle" y="{{ SUBTITLE_OFFSET_Y }}">
+        {% for i, line in enumerate(SUBTITLE_LINES) -%}
+          <tspan x="0" dy="{{ 0 if i == 0 else SUB_LINE_DY }}">{{ line }}</tspan>
+        {%- endfor %}
+      </text>
     {% endif %}
   </g>
 
@@ -78,22 +89,24 @@ SVG_TEMPLATE = """\
 </svg>
 """
 
-# ------------------ Helpers ------------------
+# ---------- Helpers ----------
+def humanize_safe_theme(s: str) -> str:
+    base = s.replace("_", " ").replace("-", " ").strip()
+    return " ".join(w.capitalize() for w in base.split())
+
 def load_palette(palette_arg: str) -> dict:
     if not palette_arg:
         return PALETTES["warm"]
     if palette_arg.lower() in PALETTES:
         return PALETTES[palette_arg.lower()]
-    # allow JSON file
     p = Path(palette_arg)
     if p.exists():
         with p.open("r") as f:
             d = json.load(f)
-            # basic validation
-            for k in ("BG1","BG2","TITLE_COLOR","SUBTITLE_COLOR","BADGE_BG","BADGE_COLOR"):
-                if k not in d:
-                    raise ValueError(f"Palette JSON missing key: {k}")
-            return d
+        for k in ("BG1","BG2","TITLE_COLOR","SUBTITLE_COLOR","BADGE_BG","BADGE_COLOR"):
+            if k not in d:
+                raise ValueError(f"Palette JSON missing key: {k}")
+        return d
     raise ValueError(f"Unknown palette: {palette_arg}")
 
 def find_art(base: Path, safe: str, explicit_name: Optional[str]) -> Path:
@@ -105,27 +118,39 @@ def find_art(base: Path, safe: str, explicit_name: Optional[str]) -> Path:
             return cand
         raise FileNotFoundError(f"Art not found: {cand}")
     # Try <safe>_art.*, then <safe>.*
-    for pattern in (f"{safe}_art.*", f"{safe}.*"):
+    for pattern in (f"{safe}_art", f"{safe}"):
         for ext in ("png", "jpg", "jpeg", "webp"):
-            cand = base / pattern.replace(".*", f".{ext}")
+            cand = base / f"{pattern}.{ext}"
             if cand.exists():
                 return cand
     raise FileNotFoundError(f"No art found in {base} for '{safe}' (expected '{safe}_art.(png|jpg|jpeg|webp)' or '{safe}.*')")
 
 def upscale_to_3000(src: Path) -> Path:
-    """Resize to 3000x3000 with LANCZOS + mild Unsharp; returns path to a temp PNG if scaled, else original path."""
+    """Resize to 3000x3000 with LANCZOS + mild Unsharp; returns temp PNG if scaled, else original path."""
     with Image.open(src) as im:
         im = im.convert("RGBA")
         w, h = im.size
         if (w, h) == (3000, 3000):
             return src
         tmp = Path(tempfile.mkstemp(suffix=".png")[1])
-        # Best-quality resize for CPU
         up = im.resize((3000, 3000), resample=Image.LANCZOS)
-        # Gentle unsharp (Pillow uses radius (px), percent 0–500, threshold 0–255)
         up = up.filter(ImageFilter.UnsharpMask(radius=0.6, percent=60, threshold=2))
         up.save(tmp, "PNG")
         return tmp
+
+def wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
+    """Soft wrap by words; trims to max_lines with ellipsis if needed."""
+    if not text:
+        return []
+    lines = textwrap.wrap(text, width=width)
+    if len(lines) > max_lines:
+        keep = lines[:max_lines]
+        # add ellipsis to last line if we trimmed content
+        if len(" ".join(lines[max_lines-1:])) > 0:
+            if len(keep[-1]) > 3:
+                keep[-1] = keep[-1].rstrip(". ") + "…"
+        return keep
+    return lines
 
 def svg_to_png(svg_bytes: bytes, out_png: Path):
     """Prefer CairoSVG; fallback to Inkscape CLI if present."""
@@ -146,7 +171,6 @@ def svg_to_png(svg_bytes: bytes, out_png: Path):
             "--export-width=3000",
             "--export-height=3000",
         ]
-        import subprocess
         subprocess.run(cmd, check=True)
         tmp_svg.unlink(missing_ok=True)
         return
@@ -157,17 +181,53 @@ def png_to_jpg(png_path: Path, jpg_path: Path, quality=92):
         im = im.convert("RGB")
         im.save(jpg_path, "JPEG", quality=quality, optimize=True)
 
-# ------------------ Main ------------------
+def embed_cover_in_mp3s(folder: Path, cover_path: Path):
+    ffmpeg = shutil.which("ffmpeg")
+    if not ffmpeg:
+        print("⚠️  ffmpeg not found; skipping MP3 art embed.", file=sys.stderr)
+        return
+    mp3s = sorted(folder.glob("*.mp3"))
+    if not mp3s:
+        print("ℹ️  No MP3 files to tag in", folder)
+        return
+    for f in mp3s:
+        tmp = f.with_name(f"_tmp_{f.name}")
+        # Map audio from input, add cover as attached picture (JPEG), drop any existing pictures
+        cmd = [
+            ffmpeg, "-y",
+            "-i", str(f),
+            "-i", str(cover_path),
+            "-map", "0:a", "-map", "1:v",
+            "-c:a", "copy", "-c:v", "mjpeg",
+            "-disposition:v", "attached_pic",
+            str(tmp)
+        ]
+        try:
+            subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            tmp.replace(f)
+            print(f"🎵 Embedded cover into {f.name}")
+        except subprocess.CalledProcessError:
+            if tmp.exists():
+                tmp.unlink()
+            print(f"⚠️  Failed to embed cover into {f.name}", file=sys.stderr)
+
+# ---------- Main ----------
 def main():
-    ap = argparse.ArgumentParser(description="Build a story cover from drop-in art and template.")
-    ap.add_argument("safeTheme", help="safe theme (folder + filename base)")
-    ap.add_argument("--title", required=True, help="Cover title text")
-    ap.add_argument("--subtitle", default="", help="Optional subtitle")
-    ap.add_argument("--badge", default="", help="Optional badge (e.g., '3 Narrator Voices')")
-    ap.add_argument("--palette", default="warm", help="warm|cool|forest or path to palette.json")
+    ap = argparse.ArgumentParser(description="Build a story cover and optionally embed into MP3s.")
+    ap.add_argument("safeTheme", help="safe theme slug (folder + filename base)")
+    ap.add_argument("--title", default="", help="Cover title text; defaults to title-cased safeTheme")
+    ap.add_argument("--subtitle", default="", help="Optional subtitle (e.g., 'Age 3–7 • Sharing ...')")
+    ap.add_argument("--badge", default="", help="Optional badge (e.g., 'Includes 3 narrator voices')")
+    ap.add_argument("--palette", default="warm", help="warm|cool|forest or /path/palette.json")
     ap.add_argument("--art", default="", help="Explicit art filename in base folder (or absolute path)")
     ap.add_argument("--base", default=DEFAULT_BASE, help=f"Base path (default {DEFAULT_BASE})")
     ap.add_argument("--out-name", default="", help="Override output filename (defaults to {safeTheme}_cover.jpg)")
+    ap.add_argument("--no-embed", action="store_true", help="Skip embedding cover.jpg into MP3s")
+    # advanced text fitting
+    ap.add_argument("--title-width", type=int, default=22, help="Approx chars per title line (wrap)")
+    ap.add_argument("--title-lines", type=int, default=2, help="Max title lines")
+    ap.add_argument("--subtitle-width", type=int, default=38, help="Approx chars per subtitle line (wrap)")
+    ap.add_argument("--subtitle-lines", type=int, default=2, help="Max subtitle lines")
     args = ap.parse_args()
 
     base = Path(args.base).resolve()
@@ -177,23 +237,45 @@ def main():
     out_name = args.out_name or f"{safe}_cover.jpg"
     out_path = outdir / out_name
 
-    # 1) Palette
+    # Palette
     pal = load_palette(args.palette)
 
-    # 2) Locate & normalize art
+    # Title/Subtitle
+    title = args.title.strip() or humanize_safe_theme(safe)
+    subtitle = args.subtitle.strip()
+    title_lines = wrap_lines(title, width=args.title_width, max_lines=args.title_lines)
+    subtitle_lines = wrap_lines(subtitle, width=args.subtitle_width, max_lines=args.subtitle_lines)
+
+    # Basic font sizes (shrink title a bit if multi-line)
+    TITLE_SIZE = 140 if len(title_lines) == 1 else 120
+    SUB_SIZE = 80
+
+    # Y positioning: if title has extra lines, lift block a touch
+    TEXT_BASE_Y = 2150 - (0 if len(title_lines) == 1 else 40)
+    TITLE_LINE_DY = 150
+    SUB_LINE_DY = 100
+    SUBTITLE_OFFSET_Y = 160 + (TITLE_LINE_DY * (len(title_lines)-1 if len(title_lines)>0 else 0))
+
+    # Art
     art_src = find_art(base, safe, args.art or None)
     art_norm = upscale_to_3000(art_src)
 
-    # 3) Render SVG
+    # Render SVG
     svg = Template(SVG_TEMPLATE).render(
-        TITLE=args.title,
-        SUBTITLE=args.subtitle,
-        BADGE=args.badge,
         ART_PATH=str(art_norm),
+        TITLE_LINES=title_lines,
+        SUBTITLE_LINES=subtitle_lines,
+        BADGE=args.badge.strip(),
+        TEXT_BASE_Y=TEXT_BASE_Y,
+        TITLE_LINE_DY=TITLE_LINE_DY,
+        SUB_LINE_DY=SUB_LINE_DY,
+        SUBTITLE_OFFSET_Y=SUBTITLE_OFFSET_Y,
+        TITLE_SIZE=TITLE_SIZE,
+        SUB_SIZE=SUB_SIZE,
         **pal,
     ).encode("utf-8")
 
-    # 4) SVG -> PNG -> JPG
+    # SVG -> PNG -> JPG
     tmp_png = Path(tempfile.mkstemp(suffix=".png")[1])
     try:
         svg_to_png(svg, tmp_png)
@@ -201,12 +283,15 @@ def main():
     finally:
         try: tmp_png.unlink()
         except Exception: pass
-        # remove temp art copy if created
         if art_norm != art_src:
             try: Path(art_norm).unlink()
             except Exception: pass
 
     print(f"✅ Cover written: {out_path}")
+
+    # Embed into MP3s
+    if not args.no_embed:
+        embed_cover_in_mp3s(outdir, out_path)
 
 if __name__ == "__main__":
     try:
