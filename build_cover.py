@@ -153,28 +153,65 @@ def wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
     return lines
 
 def svg_to_png(svg_bytes: bytes, out_png: Path):
-    """Prefer CairoSVG; fallback to Inkscape CLI if present."""
+    """Render SVG to PNG.
+    Order: CairoSVG (python) -> Inkscape 1.x CLI -> Inkscape 0.92 legacy CLI -> rsvg-convert.
+    Prints the CairoSVG error if it fails so we know why it fell back.
+    """
+    # 1) CairoSVG (preferred)
     try:
         import cairosvg
-        cairosvg.svg2png(bytestring=svg_bytes, write_to=str(out_png), output_width=3000, output_height=3000)
+        cairosvg.svg2png(
+            bytestring=svg_bytes,
+            write_to=str(out_png),
+            output_width=3000,
+            output_height=3000
+        )
         return
-    except Exception:
-        pass
-    inkscape = shutil.which("inkscape")
-    if inkscape:
-        tmp_svg = Path(tempfile.mkstemp(suffix=".svg")[1])
-        tmp_svg.write_bytes(svg_bytes)
-        cmd = [
-            inkscape, str(tmp_svg),
-            "--export-type=png",
-            f"--export-filename={out_png}",
-            "--export-width=3000",
-            "--export-height=3000",
-        ]
-        subprocess.run(cmd, check=True)
-        tmp_svg.unlink(missing_ok=True)
-        return
-    raise RuntimeError("No renderer available. Install 'cairosvg' (pip) or 'inkscape' (apt).")
+    except Exception as e:
+        # Show why CairoSVG failed, then try CLIs
+        print(f"⚠️  CairoSVG render failed: {e}", file=sys.stderr)
+
+    # Write temp SVG for CLI renderers
+    tmp_svg = Path(tempfile.mkstemp(suffix=".svg")[1])
+    tmp_svg.write_bytes(svg_bytes)
+
+    try:
+        inkscape = shutil.which("inkscape")
+        if inkscape:
+            # 2) Inkscape 1.0+ (new CLI)
+            try:
+                subprocess.run(
+                    [inkscape, str(tmp_svg),
+                     "--export-type=png",
+                     f"--export-filename={out_png}",
+                     "--export-width=3000",
+                     "--export-height=3000"],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                return
+            except subprocess.CalledProcessError:
+                # 3) Inkscape 0.92 (legacy CLI)
+                subprocess.run(
+                    [inkscape, str(tmp_svg),
+                     f"--export-png={out_png}",
+                     "-w", "3000", "-h", "3000"],
+                    check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+                )
+                return
+
+        # 4) librsvg fallback
+        rsvg = shutil.which("rsvg-convert")
+        if rsvg:
+            subprocess.run(
+                [rsvg, "-w", "3000", "-h", "3000", "-o", str(out_png), str(tmp_svg)],
+                check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
+            )
+            return
+
+        raise RuntimeError("No renderer available. Install 'cairosvg' (pip) or 'inkscape' or 'librsvg2-bin'.")
+    finally:
+        try: tmp_svg.unlink()
+        except Exception: pass
 
 def png_to_jpg(png_path: Path, jpg_path: Path, quality=92):
     with Image.open(png_path) as im:
