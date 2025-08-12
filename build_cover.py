@@ -65,16 +65,16 @@ SVG_TEMPLATE = """\
   <g transform="translate(150, {{ TEXT_BASE_Y }})">
     {% if TITLE_LINES %}
     <text class="title">
-      {% for i, line in enumerate(TITLE_LINES) -%}
-        <tspan x="0" dy="{{ 0 if i == 0 else TITLE_LINE_DY }}">{{ line }}</tspan>
+      {% for line in TITLE_LINES -%}
+        <tspan x="0" dy="{{ 0 if loop.first else TITLE_LINE_DY }}">{{ line }}</tspan>
       {%- endfor %}
     </text>
     {% endif %}
 
     {% if SUBTITLE_LINES %}
       <text class="subtitle" y="{{ SUBTITLE_OFFSET_Y }}">
-        {% for i, line in enumerate(SUBTITLE_LINES) -%}
-          <tspan x="0" dy="{{ 0 if i == 0 else SUB_LINE_DY }}">{{ line }}</tspan>
+        {% for line in SUBTITLE_LINES -%}
+          <tspan x="0" dy="{{ 0 if loop.first else SUB_LINE_DY }}">{{ line }}</tspan>
         {%- endfor %}
       </text>
     {% endif %}
