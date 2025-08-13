@@ -55,10 +55,10 @@ SVG_TEMPLATE = """\
 
   <rect x="0" y="0" width="3000" height="3000" fill="url(#bggrad)"/>
 
-  {% if ART_PATH %}
+  {% if ART_HREF %}
   <image x="350" y="500" width="2300" height="1500"
          preserveAspectRatio="xMidYMid meet"
-         href="{{ ART_PATH }}" xlink:href="{{ ART_PATH }}" opacity="0.96"/>
+         href="{{ ART_HREF }}" opacity="0.96"/>
   {% endif %}
 
   <!-- Text block -->
@@ -160,11 +160,13 @@ def svg_to_png(svg_bytes: bytes, out_png: Path):
     # 1) CairoSVG (preferred)
     try:
         import cairosvg
+        from pathlib import Path
         cairosvg.svg2png(
-            bytestring=svg_bytes,
-            write_to=str(out_png),
-            output_width=3000,
-            output_height=3000
+          bytestring=svg_bytes,
+          write_to=str(out_png),
+          output_width=3000,
+          output_height=3000,
+          url=Path(".").resolve().as_uri()
         )
         return
     except Exception as e:
@@ -338,10 +340,11 @@ def main():
     # Art
     art_src = find_art(base, safe, args.art or None)
     art_norm = upscale_to_3000(art_src)
+    art_href = Path(art_norm).resolve().as_uri()  # <<< key line
 
     # Render SVG
     svg = Template(SVG_TEMPLATE).render(
-        ART_PATH=str(art_norm),
+        ART_HREF=art_href,
         TITLE_LINES=title_lines,
         SUBTITLE_LINES=subtitle_lines,
         BADGE=args.badge.strip(),
