@@ -2,30 +2,31 @@
 """
 build_cover.py
 
-One-shot cover builder + optional MP3 cover embedding.
+One-shot cover builder + optional MP3 cover embedding + zipping.
 
 - Finds your art in the base folder (default /mnt/ai_data/BedtimeStories)
 - Resizes art to 3000x3000 (CPU-friendly, Pillow)
-- Renders an SVG cover (gradient + art + title/subtitle/badge) and exports JPG
-- Optionally embeds that cover.jpg into each MP3 in the story folder via ffmpeg
+- Embeds art as base64 data URI in an SVG, renders to JPG
+- Optionally embeds the cover.jpg into each MP3 in the story folder via ffmpeg
+- Deletes the original art (in base) and zips the story folder
 
 Usage:
   ./build_cover.py <safeTheme>
-      [--title "Friendly Dinosaurs"]      # optional; auto-derived from safeTheme if omitted
+      [--title "Friendly Dinosaurs"]
       [--subtitle "Age 3–7 • Sharing makes everyone feel safe and happy"]
       [--badge "Includes 3 narrator voices"]
       [--palette warm|cool|forest|/path/palette.json]
-      [--art friendly_dinosaurs_art.png]  # optional explicit file in base or absolute path
+      [--art friendly_dinosaurs_art.png]
       [--base /mnt/ai_data/BedtimeStories]
       [--out-name friendly_dinosaurs_cover.jpg]
-      [--no-embed]                        # skip embedding cover into MP3s
+      [--no-embed]
 
 Deps:
-  sudo apt-get install imagemagick ffmpeg  (ffmpeg only needed for embedding)
-  pip install jinja2 pillow
-  (optional: pip install cairosvg or sudo apt-get install inkscape)
+  sudo apt-get install ffmpeg                (for MP3 tagging)
+  pip install jinja2 pillow cairosvg         (cairosvg optional but preferred)
+  # or sudo apt-get install inkscape or librsvg2-bin for CLI fallbacks
 """
-import argparse, os, sys, json, tempfile, shutil, subprocess, textwrap
+import argparse, os, sys, json, tempfile, shutil, subprocess, textwrap, base64, mimetypes
 from pathlib import Path
 from typing import Optional, List
 from jinja2 import Template
@@ -40,7 +41,7 @@ PALETTES = {
 }
 
 SVG_TEMPLATE = """\
-<svg width="3000" height="3000" viewBox="0 0 3000 3000" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
+<svg width="3000" height="3000" viewBox="0 0 3000 3000" xmlns="http://www.w3.org/2000/svg">
   <defs>
     <linearGradient id="bggrad" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="{{ BG1 }}"/>
@@ -55,10 +56,10 @@ SVG_TEMPLATE = """\
 
   <rect x="0" y="0" width="3000" height="3000" fill="url(#bggrad)"/>
 
-  {% if ART_HREF %}
+  {% if ART_DATA %}
   <image x="350" y="500" width="2300" height="1500"
          preserveAspectRatio="xMidYMid meet"
-         href="{{ ART_HREF }}" opacity="0.96"/>
+         href="{{ ART_DATA }}" opacity="0.96"/>
   {% endif %}
 
   <!-- Text block -->
@@ -117,7 +118,6 @@ def find_art(base: Path, safe: str, explicit_name: Optional[str]) -> Path:
         if cand.exists():
             return cand
         raise FileNotFoundError(f"Art not found: {cand}")
-    # Try <safe>_art.*, then <safe>.*
     for pattern in (f"{safe}_art", f"{safe}"):
         for ext in ("png", "jpg", "jpeg", "webp"):
             cand = base / f"{pattern}.{ext}"
@@ -139,48 +139,45 @@ def upscale_to_3000(src: Path) -> Path:
         return tmp
 
 def wrap_lines(text: str, width: int, max_lines: int) -> List[str]:
-    """Soft wrap by words; trims to max_lines with ellipsis if needed."""
     if not text:
         return []
     lines = textwrap.wrap(text, width=width)
     if len(lines) > max_lines:
         keep = lines[:max_lines]
-        # add ellipsis to last line if we trimmed content
-        if len(" ".join(lines[max_lines-1:])) > 0:
-            if len(keep[-1]) > 3:
-                keep[-1] = keep[-1].rstrip(". ") + "…"
+        if len(" ".join(lines[max_lines-1:])) > 0 and len(keep[-1]) > 3:
+            keep[-1] = keep[-1].rstrip(". ") + "…"
         return keep
     return lines
 
+def file_to_data_uri(path: Path) -> str:
+    mime, _ = mimetypes.guess_type(str(path))
+    if not mime:
+        # Prefer PNG if we created a temp PNG; else fallback generic
+        mime = "image/png" if path.suffix.lower() == ".png" else "application/octet-stream"
+    data = path.read_bytes()
+    b64 = base64.b64encode(data).decode("ascii")
+    return f"data:{mime};base64,{b64}"
+
 def svg_to_png(svg_bytes: bytes, out_png: Path):
-    """Render SVG to PNG.
-    Order: CairoSVG (python) -> Inkscape 1.x CLI -> Inkscape 0.92 legacy CLI -> rsvg-convert.
-    Prints the CairoSVG error if it fails so we know why it fell back.
-    """
-    # 1) CairoSVG (preferred)
+    """Render SVG to PNG. CairoSVG first; then Inkscape 1.x; then Inkscape 0.92; then rsvg-convert."""
     try:
         import cairosvg
-        from pathlib import Path
         cairosvg.svg2png(
-          bytestring=svg_bytes,
-          write_to=str(out_png),
-          output_width=3000,
-          output_height=3000,
-          url=Path(".").resolve().as_uri()
+            bytestring=svg_bytes,
+            write_to=str(out_png),
+            output_width=3000,
+            output_height=3000,
+            url=Path(".").resolve().as_uri()
         )
         return
     except Exception as e:
-        # Show why CairoSVG failed, then try CLIs
         print(f"⚠️  CairoSVG render failed: {e}", file=sys.stderr)
 
-    # Write temp SVG for CLI renderers
     tmp_svg = Path(tempfile.mkstemp(suffix=".svg")[1])
     tmp_svg.write_bytes(svg_bytes)
-
     try:
         inkscape = shutil.which("inkscape")
         if inkscape:
-            # 2) Inkscape 1.0+ (new CLI)
             try:
                 subprocess.run(
                     [inkscape, str(tmp_svg),
@@ -192,7 +189,6 @@ def svg_to_png(svg_bytes: bytes, out_png: Path):
                 )
                 return
             except subprocess.CalledProcessError:
-                # 3) Inkscape 0.92 (legacy CLI)
                 subprocess.run(
                     [inkscape, str(tmp_svg),
                      f"--export-png={out_png}",
@@ -200,8 +196,6 @@ def svg_to_png(svg_bytes: bytes, out_png: Path):
                     check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
                 )
                 return
-
-        # 4) librsvg fallback
         rsvg = shutil.which("rsvg-convert")
         if rsvg:
             subprocess.run(
@@ -209,7 +203,6 @@ def svg_to_png(svg_bytes: bytes, out_png: Path):
                 check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL
             )
             return
-
         raise RuntimeError("No renderer available. Install 'cairosvg' (pip) or 'inkscape' or 'librsvg2-bin'.")
     finally:
         try: tmp_svg.unlink()
@@ -221,16 +214,12 @@ def png_to_jpg(png_path: Path, jpg_path: Path, quality=92):
         im.save(jpg_path, "JPEG", quality=quality, optimize=True)
 
 def _is_within(child: Path, parent: Path) -> bool:
-    """Py3.8-safe 'is_relative_to'."""
     try:
-        child_res = child.resolve()
-        parent_res = parent.resolve()
+        return str(child.resolve()).startswith(str(parent.resolve()) + os.sep)
     except Exception:
         return False
-    return str(child_res).startswith(str(parent_res) + os.sep)
 
 def delete_source_art(art_src: Path, base: Path):
-    """Delete the original art file if it lives under the base folder."""
     try:
         if art_src.is_file() and _is_within(art_src, base):
             art_src.unlink()
@@ -241,26 +230,18 @@ def delete_source_art(art_src: Path, base: Path):
         print(f"⚠️  Could not delete art ({art_src}): {e}")
 
 def zip_story_folder(outdir: Path, safe: str) -> Path:
-    """
-    Zip the CONTENTS of the story folder (not the parent), then move zip into the folder.
-    Uses a temp location to avoid the zip being included in itself.
-    """
     tmpdir = Path(tempfile.mkdtemp())
     try:
-        base_name = tmpdir / safe  # shutil will append .zip
+        base_name = tmpdir / safe
         zip_path = shutil.make_archive(str(base_name), "zip", root_dir=str(outdir))
         dest = outdir / f"{safe}.zip"
-        # overwrite if exists
         if dest.exists():
             dest.unlink()
         shutil.move(zip_path, dest)
         print(f"📦 Created bundle: {dest}")
         return dest
     finally:
-        try:
-            shutil.rmtree(tmpdir, ignore_errors=True)
-        except Exception:
-            pass
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 def embed_cover_in_mp3s(folder: Path, cover_path: Path):
     ffmpeg = shutil.which("ffmpeg")
@@ -273,7 +254,6 @@ def embed_cover_in_mp3s(folder: Path, cover_path: Path):
         return
     for f in mp3s:
         tmp = f.with_name(f"_tmp_{f.name}")
-        # Map audio from input, add cover as attached picture (JPEG), drop any existing pictures
         cmd = [
             ffmpeg, "-y",
             "-i", str(f),
@@ -304,7 +284,6 @@ def main():
     ap.add_argument("--base", default=DEFAULT_BASE, help=f"Base path (default {DEFAULT_BASE})")
     ap.add_argument("--out-name", default="", help="Override output filename (defaults to {safeTheme}_cover.jpg)")
     ap.add_argument("--no-embed", action="store_true", help="Skip embedding cover.jpg into MP3s")
-    # advanced text fitting
     ap.add_argument("--title-width", type=int, default=22, help="Approx chars per title line (wrap)")
     ap.add_argument("--title-lines", type=int, default=2, help="Max title lines")
     ap.add_argument("--subtitle-width", type=int, default=38, help="Approx chars per subtitle line (wrap)")
@@ -315,8 +294,7 @@ def main():
     safe = args.safeTheme
     outdir = base / safe
     outdir.mkdir(parents=True, exist_ok=True)
-    out_name = args.out_name or f"{safe}_cover.jpg"
-    out_path = outdir / out_name
+    out_path = outdir / (args.out_name or f"{safe}_cover.jpg")
 
     # Palette
     pal = load_palette(args.palette)
@@ -327,24 +305,22 @@ def main():
     title_lines = wrap_lines(title, width=args.title_width, max_lines=args.title_lines)
     subtitle_lines = wrap_lines(subtitle, width=args.subtitle_width, max_lines=args.subtitle_lines)
 
-    # Basic font sizes (shrink title a bit if multi-line)
+    # Font sizes / layout
     TITLE_SIZE = 140 if len(title_lines) == 1 else 120
     SUB_SIZE = 80
-
-    # Y positioning: if title has extra lines, lift block a touch
     TEXT_BASE_Y = 2150 - (0 if len(title_lines) == 1 else 40)
     TITLE_LINE_DY = 150
     SUB_LINE_DY = 100
     SUBTITLE_OFFSET_Y = 160 + (TITLE_LINE_DY * (len(title_lines)-1 if len(title_lines)>0 else 0))
 
-    # Art
+    # Art → normalize size → embed as data URI
     art_src = find_art(base, safe, args.art or None)
     art_norm = upscale_to_3000(art_src)
-    art_href = Path(art_norm).resolve().as_uri()  # <<< key line
+    art_data_uri = file_to_data_uri(Path(art_norm))
 
     # Render SVG
     svg = Template(SVG_TEMPLATE).render(
-        ART_HREF=art_href,
+        ART_DATA=art_data_uri,
         TITLE_LINES=title_lines,
         SUBTITLE_LINES=subtitle_lines,
         BADGE=args.badge.strip(),
@@ -375,14 +351,13 @@ def main():
     if not args.no_embed:
         embed_cover_in_mp3s(outdir, out_path)
 
-    # --- NEW: delete the original source art and zip the folder ---
+    # Cleanup + zip
     try:
-        delete_source_art(art_src, base)  # remove the original art from the base folder
+        delete_source_art(art_src, base)
     except Exception as e:
         print(f"⚠️  delete_source_art failed: {e}")
-
     try:
-        zip_story_folder(outdir, safe)    # create {safe}.zip inside the story folder
+        zip_story_folder(outdir, safe)
     except Exception as e:
         print(f"⚠️  zip_story_folder failed: {e}")
 
