@@ -40,7 +40,7 @@ PALETTES = {
 }
 
 SVG_TEMPLATE = """\
-<svg width="3000" height="3000" viewBox="0 0 3000 3000" xmlns="http://www.w3.org/2000/svg">
+<svg width="3000" height="3000" viewBox="0 0 3000 3000" xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink">
   <defs>
     <linearGradient id="bggrad" x1="0" y1="0" x2="0" y2="1">
       <stop offset="0%" stop-color="{{ BG1 }}"/>
