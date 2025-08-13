@@ -218,6 +218,48 @@ def png_to_jpg(png_path: Path, jpg_path: Path, quality=92):
         im = im.convert("RGB")
         im.save(jpg_path, "JPEG", quality=quality, optimize=True)
 
+def _is_within(child: Path, parent: Path) -> bool:
+    """Py3.8-safe 'is_relative_to'."""
+    try:
+        child_res = child.resolve()
+        parent_res = parent.resolve()
+    except Exception:
+        return False
+    return str(child_res).startswith(str(parent_res) + os.sep)
+
+def delete_source_art(art_src: Path, base: Path):
+    """Delete the original art file if it lives under the base folder."""
+    try:
+        if art_src.is_file() and _is_within(art_src, base):
+            art_src.unlink()
+            print(f"🗑️  Deleted source art: {art_src.name}")
+        else:
+            print(f"ℹ️  Skipped deleting art outside base: {art_src}")
+    except Exception as e:
+        print(f"⚠️  Could not delete art ({art_src}): {e}")
+
+def zip_story_folder(outdir: Path, safe: str) -> Path:
+    """
+    Zip the CONTENTS of the story folder (not the parent), then move zip into the folder.
+    Uses a temp location to avoid the zip being included in itself.
+    """
+    tmpdir = Path(tempfile.mkdtemp())
+    try:
+        base_name = tmpdir / safe  # shutil will append .zip
+        zip_path = shutil.make_archive(str(base_name), "zip", root_dir=str(outdir))
+        dest = outdir / f"{safe}.zip"
+        # overwrite if exists
+        if dest.exists():
+            dest.unlink()
+        shutil.move(zip_path, dest)
+        print(f"📦 Created bundle: {dest}")
+        return dest
+    finally:
+        try:
+            shutil.rmtree(tmpdir, ignore_errors=True)
+        except Exception:
+            pass
+
 def embed_cover_in_mp3s(folder: Path, cover_path: Path):
     ffmpeg = shutil.which("ffmpeg")
     if not ffmpeg:
@@ -329,6 +371,17 @@ def main():
     # Embed into MP3s
     if not args.no_embed:
         embed_cover_in_mp3s(outdir, out_path)
+
+    # --- NEW: delete the original source art and zip the folder ---
+    try:
+        delete_source_art(art_src, base)  # remove the original art from the base folder
+    except Exception as e:
+        print(f"⚠️  delete_source_art failed: {e}")
+
+    try:
+        zip_story_folder(outdir, safe)    # create {safe}.zip inside the story folder
+    except Exception as e:
+        print(f"⚠️  zip_story_folder failed: {e}")
 
 if __name__ == "__main__":
     try:
